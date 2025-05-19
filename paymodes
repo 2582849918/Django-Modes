@@ -1,0 +1,325 @@
+from django.db import models
+from django.utils.timezone import now
+from django.contrib.auth import get_user_model
+from django.conf import settings
+from typing import Optional
+from django.utils.dateparse import parse_datetime
+from django.utils.timezone import datetime
+
+CONSUME_PRODUCT = 'CONSUME_PRODUCT'
+REWARD_COUPON = 'REWARD_COUPON'
+GIVE_SYSTEM = 'GIVE_SYSTEM'
+PURCHASE_PRODUCT = 'PURCHASE_PRODUCT'
+PURCHASE_PACKAGE = 'PURCHASE_PACKAGE'
+
+UNLIMITED_QUANTITY = -1
+
+ORDER_STATUS_SUCCESS = 'SUCCESS'
+
+PACKAGE = 'PACKAGE'  # 套餐
+TIMESCARD = 'TIMESCARD'  # 次卡
+
+# 订单类型
+ORDER_TYPE_CHOICES = [
+    ('PACKAGE', '套餐'),
+    ('TIMESCARD', '次卡'),
+]
+
+# 套餐类型
+PACKAGE_TYPES = [
+    ('MONTHLY', '月卡'),
+    ('SEASONAL', '季卡'),
+    ('ANNUAL', '年卡'),
+]
+
+# 订单状态
+ORDER_STATUS = [
+    ('NOTPAY', '未支付'),
+    ('SUCCESS', '支付成功'),
+    ('CLOSED', '已关闭'),
+    ('REFUND', '已退款'),
+]
+
+# 操作类型
+OPERATION_TYPE_CHOICES = [
+    ('PURCHASE_PACKAGE', '购买套餐'),
+    ('PURCHASE_PRODUCT', '购买商品'),
+    ('GIVE_SYSTEM', '系统赠送'),
+    ('REWARD_COUPON', '消费券奖励'),
+    ('CONSUME_PRODUCT', '消费商品'),
+]
+
+User = get_user_model()
+
+
+# ==============================================
+#  套餐表
+# ==============================================
+class Package(models.Model):
+    package_id = models.AutoField(primary_key=True)
+    name = models.CharField(max_length=100, verbose_name='套餐名称')
+    price = models.DecimalField(max_digits=10, decimal_places=2, verbose_name='套餐价格')
+    points = models.IntegerField(verbose_name='积分')  # 购买获得的积分
+    package_type = models.CharField(max_length=20, choices=PACKAGE_TYPES, verbose_name='套餐类型')
+    is_active = models.BooleanField(default=True, verbose_name='是否可用')
+    description = models.TextField(null=True, blank=True, verbose_name='套餐描述')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'payments_package'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['name', 'package_type'],
+                name='unique_package_name_type'
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.get_package_type_display()})"
+
+
+# ==============================================
+#  商品表
+# ==============================================
+class Product(models.Model):
+    name = models.CharField(max_length=255, unique=True, verbose_name='商品名称')
+    price = models.DecimalField(max_digits=10, decimal_places=2, default=0.00, verbose_name='单价')  # 元
+    points = models.PositiveIntegerField(default=0, verbose_name='商品积分')
+    is_active = models.BooleanField(default=True, verbose_name='是否上架')
+    description = models.TextField(blank=True, null=True, verbose_name='商品描述')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'payments_product'
+
+    def __str__(self):
+        return self.name
+
+
+# ==============================================
+#  订单表
+# ==============================================
+class Order(models.Model):
+    order_id = models.CharField(max_length=50, null=True, blank=True, verbose_name='商户订单编号')
+    order_type = models.CharField(max_length=20, choices=ORDER_TYPE_CHOICES, verbose_name='订单类型')
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, verbose_name='用户')
+    title = models.CharField(max_length=256, null=True, blank=True, verbose_name='订单标题')
+    package = models.ForeignKey(Package, null=True, blank=True, on_delete=models.CASCADE, verbose_name='购买的套餐')
+    product = models.ForeignKey(Product, null=True, blank=True, on_delete=models.CASCADE, verbose_name='购买的商品')
+    quantity = models.IntegerField(default=0, verbose_name='购买数量')
+    price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True,
+                                verbose_name='订单金额(单位: 元)')
+    payment_type = models.CharField(max_length=20, null=True, blank=True, verbose_name='支付方式')
+    user_ip = models.GenericIPAddressField(null=True, blank=True, verbose_name='用户IP地址')
+    order_status = models.CharField(max_length=10, choices=ORDER_STATUS, default='NOTPAY', verbose_name='订单状态')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'payments_order'
+
+    def __str__(self):
+        return f"Order {self.order_id} - {self.get_order_type_display()}"
+
+
+# ==============================================
+#  套餐 - 商品 关联表(多对多中间表)
+# ==============================================
+class PackageProduct(models.Model):
+    id = models.AutoField(primary_key=True)
+    package = models.ForeignKey(Package, on_delete=models.CASCADE, verbose_name='套餐')
+    package_type = models.CharField(max_length=20, choices=PACKAGE_TYPES, verbose_name='套餐类型')
+    product = models.ForeignKey(Product, on_delete=models.CASCADE, verbose_name='商品')
+    quantity = models.IntegerField(verbose_name='数量(-1 表示无限次)')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'payments_package_product'
+        constraints = [
+            models.UniqueConstraint(
+                fields=['package', 'product', 'package_type'],
+                name='unique_package_product_type'
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.package} - {self.product} x {self.quantity}"
+
+    @property
+    def package_type_chinese(self):
+        package_type_map = dict(PACKAGE_TYPES)
+        return package_type_map.get(self.package_type, self.package_type)
+
+
+def query_package_product_by_package(package):
+    if not package:
+        return PackageProduct.objects.none()
+    return PackageProduct.objects.filter(package=package)
+
+
+# ==============================================
+#  用户商品记录表
+# ==============================================
+class UserProduct(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, verbose_name='用户')
+    product = models.ForeignKey('Product', on_delete=models.CASCADE, verbose_name='商品')
+    order_type = models.CharField(max_length=20, choices=ORDER_TYPE_CHOICES, verbose_name='订单类型')
+    operation_type = models.CharField(max_length=20, choices=OPERATION_TYPE_CHOICES, verbose_name='操作类型')
+    change_quantity = models.IntegerField(default=0, verbose_name='使用数量')  # 消费为负，购买或赠送为正
+    expire_date = models.DateTimeField(blank=True, null=True, verbose_name='过期时间')
+    total_quantity = models.IntegerField(default=0, verbose_name='可用数量')  # (-1 表示无限次)
+    description = models.TextField(null=True, blank=True, verbose_name='套餐描述')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'payments_user_product'
+        verbose_name = '用户商品'
+        verbose_name_plural = '用户商品'
+
+    def __str__(self):
+        return f"User {self.user} used {self.product}"
+
+
+def query_user_product_package_record(user, product):
+    """
+    查询用户某个商品的最新有效"套餐"记录（未过期）
+    """
+    if not user or not product:
+        return None
+
+    return (
+        UserProduct.objects
+        .filter(
+            user=user,
+            product=product,
+            order_type=PACKAGE,
+            expire_date__gt=now()  # 确保未过期
+        )
+        .order_by('-created_at')  # 按创建时间降序排列，最新的在最前
+        .first()  # 取最新的一条记录
+    )
+
+
+def query_user_product_times_card_record(user, product):
+    """
+    查询用户某个商品的最新“次卡”记录(total_quantity>0)
+    """
+    if not user or not product:
+        return None
+
+    return (
+        UserProduct.objects
+        .filter(
+            user=user,
+            product=product,
+            order_type=TIMESCARD,
+            total_quantity__gt=0
+        )
+        .order_by('-created_at')  # 按创建时间降序排列，最新的在最前
+        .first()  # 取最新的一条记录
+    )
+
+
+def create_user_product_record(
+        user: User,
+        product: 'Product',
+        order_type: str,
+        operation_type: str,
+        change_quantity: int,
+        total_quantity: int,
+        expire_date: Optional[datetime]
+) -> None:
+    """
+    创建用户产品使用记录
+    """
+    print(
+        f"product:{product} order_type:{order_type} operation_type:{operation_type} change_quantity:{change_quantity} total_quantity：{total_quantity} expire_date：{expire_date}")
+    if order_type not in dict(ORDER_TYPE_CHOICES):
+        raise ValueError(f"Invalid order_type: {order_type}")
+
+    if operation_type not in dict(OPERATION_TYPE_CHOICES):
+        raise ValueError(f"Invalid operation_type: {operation_type}")
+
+    if isinstance(expire_date, str):
+        expire_date = parse_datetime(expire_date)
+
+    if expire_date is not None and not isinstance(expire_date, datetime):
+        raise TypeError(f"Parameter 'expire_date' must be a datetime object or None, got {type(expire_date).__name__}")
+
+    UserProduct.objects.create(
+        user=user,
+        product=product,
+        order_type=order_type,
+        operation_type=operation_type,
+        change_quantity=change_quantity,
+        expire_date=expire_date,
+        total_quantity=total_quantity,
+        description=""
+    )
+
+
+# ==============================================
+#  用户积分记录表
+# ==============================================
+class UserPoints(models.Model):
+    id = models.AutoField(primary_key=True)
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, verbose_name='用户')
+    change_point = models.IntegerField(verbose_name='积分变动')
+    change_reason = models.CharField(max_length=255, verbose_name='变更原因')
+    total_points = models.IntegerField(default=0, verbose_name='用户总积分')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'payments_user_points'
+        indexes = [
+            models.Index(fields=['user', 'created_at']),
+        ]
+        constraints = [
+            # 等价于 unique_together = ('user',)
+            models.UniqueConstraint(
+                fields=['user', 'created_at'],
+                name='unique_user_points_time'
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.user} - total_points: {self.total_points}"
+
+
+def query_user_point_record(user):
+    if not isinstance(user, User):
+        raise ValueError("Invalid User Object")
+
+    return (
+        UserPoints.objects
+        .filter(user=user, )
+        .order_by('-created_at')  # 按创建时间降序排列，最新的在最前
+        .first()  # 取最新的一条记录
+    )
+
+
+# ==============================================
+#  退款信息表
+# ==============================================
+class RefundInfo(models.Model):
+    """退款信息表"""
+    order_id = models.CharField(max_length=50, verbose_name='商户订单编号')
+    refund_no = models.CharField(max_length=50, verbose_name='退款单号')
+    price = models.IntegerField(verbose_name='订单金额(单位: 分)')
+    refund = models.IntegerField(verbose_name='退款金额(单位: 分)')
+    reason = models.CharField(max_length=256, verbose_name='退款原因')
+    refund_status = models.CharField(max_length=20, default='PROCESSING', verbose_name='退款状态')
+    content_return = models.TextField(null=True, blank=True, verbose_name='退款返回数据')
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
+    updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
+
+    class Meta:
+        db_table = 'payments_refund_info'
+
+    def __str__(self):
+        return f"Refund {self.refund_no} for order {self.order_id}"
