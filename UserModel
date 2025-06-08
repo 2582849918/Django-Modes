@@ -1,0 +1,338 @@
+import uuid
+import string
+import random
+
+from django.db import transaction
+from django.db.models import Q
+from django.db import models
+from django.core.exceptions import ObjectDoesNotExist
+from datetime import timedelta
+from django.utils import timezone
+from django.conf import settings
+from django.core.exceptions import ValidationError
+from typing import Optional
+from utils.logger import logger
+
+from django.contrib.auth.models import AbstractBaseUser, BaseUserManager, PermissionsMixin
+
+ACTION_CHOICES = [('login', '登陆'), ('logout', '退出'), ('download', '下载'), ('consume', '消费')]
+FRONTEND_CHOICES = [('client', '客户端'), ('web', 'Web')]
+ACTION_RESULT_CHOICES = [('success', '成功'), ('failure', '失败')]
+
+class UserManager(BaseUserManager):
+    """自定义 User 管理器，用于创建用户和超级用户"""
+    
+    def create_user(self, username=None, email=None, phone_number=None, wechat_openid=None, password=None, privilege=0, nickname=None, headimgurl=None, referrer_code=None, **extra_fields):
+        """创建普通用户"""
+        if not (username or email or phone_number or wechat_openid):
+            raise ValueError('必须提供至少一个登录标识：用户名、邮箱、电话号码或微信 OpenID')
+
+        # 生成唯一邀请码
+        invite_code = self.generate_unique_invite_code()
+
+        user = self.model(
+            username=username,
+            email=email,
+            phone_number=phone_number,
+            wechat_openid=wechat_openid,
+            privilege=privilege,
+            invite_code=invite_code,
+            referrer_code=referrer_code,
+            nickname=nickname,
+            headimgurl=headimgurl,
+            **extra_fields
+        )
+        if password:
+            user.set_password(password)
+        else:
+            user.set_unusable_password()  # 微信登录不需要密码
+
+        user.save(using=self._db)
+        return user
+    
+    def create_superuser(self, username, password=None, **extra_fields):
+        """创建超级用户"""
+        extra_fields.setdefault('is_staff', True)
+        extra_fields.setdefault('is_superuser', True)
+
+        if not username:
+            raise ValueError('创建超级用户时必须提供 username')
+        return self.create_user(username=username, password=password, **extra_fields)
+
+    def update_invite_code(self, user):
+        """更新用户的邀请码，如果用户没有邀请码则生成并保存"""
+        if user and not user.invite_code:
+            # 生成唯一邀请码
+            user.invite_code = self.generate_unique_invite_code()
+            user.save()
+        return user
+
+    def generate_unique_invite_code(self, length=8):
+        """生成指定长度的唯一邀请码"""
+        while True:
+            invite_code = self.generate_short_code(length)
+            if not User.objects.filter(invite_code=invite_code).exists():
+                return invite_code
+
+    def generate_short_code(self, length=8):
+        """生成指定长度的字母数字组合码"""
+        characters = string.ascii_uppercase + string.digits
+        return ''.join(random.choice(characters) for _ in range(length))
+
+
+# ==============================================
+#  用户表
+# ==============================================
+class User(AbstractBaseUser, PermissionsMixin):
+    """用户表，支持微信、电话和邮箱登录"""
+    PRIVILEGE_LEVEL_CHOICES = (
+        (0, '普通用户'),
+        (1, '管理员'),
+    )
+    
+    username = models.CharField(max_length=100, unique=True, null=False, blank=False)  # 用户名
+    phone_number = models.CharField(max_length=15, unique=True, null=True, blank=True)  # 电话号码
+    email = models.EmailField(unique=True, null=True, blank=True)  # 邮箱
+    wechat_openid = models.CharField(max_length=128, unique=True, null=True, blank=True)  # 微信 openid
+    password = models.CharField(max_length=128, blank=True, null=True)  # 密码（微信登录可以不需要）
+    privilege = models.IntegerField(choices=PRIVILEGE_LEVEL_CHOICES, default=0, help_text="用户权限等级")
+    is_active = models.BooleanField(default=True)  # Django 认证需要
+    is_staff = models.BooleanField(default=False)  # 是否可以进入 Django Admin
+    is_superuser = models.BooleanField(default=False)  # 超级管理员权限
+    invite_code = models.CharField(max_length=16, unique=True, null=True, blank=True, editable=False, help_text="用户邀请码")
+    referrer_code = models.CharField(max_length=16, null=True, blank=True, editable=False, help_text="推荐人邀请码")
+    nickname = models.CharField(max_length=100, blank=True, null=True) # 昵称
+    headimgurl = models.CharField(max_length=255, blank=True, null=True) # 头像
+    is_free = models.BooleanField(default=False, help_text="是否为免费用户")
+    is_internal = models.BooleanField(default=False, help_text="是否为内部人员")
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    # 必须的属性，使用 username 作为登录标识
+    USERNAME_FIELD = 'username'
+    REQUIRED_FIELDS = []  # 其它必填字段可根据需要添加
+
+    # 关联自定义管理器
+    objects = UserManager()
+
+    class Meta:
+        db_table = 'authapp_user'
+
+    def __str__(self):
+        return self.username or self.email or self.phone_number or self.wechat_openid
+    
+    @staticmethod
+    def get_user_by_openid(openid: str):
+        """根据 wechat_openid 查询用户"""
+        return User.objects.filter(wechat_openid=openid).first()
+
+
+
+
+# ==============================================
+#  用户使用信息
+# ==============================================
+class UserUseInfo(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, verbose_name='用户')
+
+    action = models.CharField(max_length=10, choices=ACTION_CHOICES, verbose_name="操作类型")
+    method = models.CharField(max_length=100, blank=True, verbose_name="登录方式或下载方式等")
+    frontend_type = models.CharField(max_length=20, choices=FRONTEND_CHOICES, verbose_name="前端类型")
+    device_id = models.CharField(max_length=100, blank=True, null=True, verbose_name="设备ID")
+    action_result = models.CharField(max_length=20, choices=ACTION_RESULT_CHOICES, blank=True, verbose_name="操作结果")
+    description = models.TextField(blank=True, verbose_name="描述信息")
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="创建时间")
+    updated_at = models.DateTimeField(auto_now=True, verbose_name="更新时间")
+
+    class Meta:
+        db_table = 'authapp_useruseinfo'
+
+    def __str__(self):
+        return f"{self.user} - {self.action} - {self.created_at}"
+
+def add_user_info(
+    user: User,
+    action: str,
+    method: str,
+    frontend_type: str,
+    device_id: str,
+    action_result: str = '',
+    description: str = ''
+) -> UserUseInfo:
+    # 校验值是否合法
+    if action not in {k for k, _ in ACTION_CHOICES}:
+        logger.error(f"Invalid action: {action}")
+        raise ValidationError(f"Invalid action: {action}")
+    if frontend_type not in {k for k, _ in FRONTEND_CHOICES}:
+        logger.error(f"Invalid frontend_type: {frontend_type}")
+        raise ValidationError(f"Invalid frontend_type: {frontend_type}")
+    if action_result and action_result not in {k for k, _ in ACTION_RESULT_CHOICES}:
+        logger.error(f"Invalid action_result: {action_result}")
+        raise ValidationError(f"Invalid action_result: {action_result}")
+
+    try:
+        return UserUseInfo.objects.create(
+            user=user,
+            action=action,
+            method=method,
+            frontend_type=frontend_type,
+            device_id=device_id,
+            action_result=action_result,
+            description=description
+        )
+    except Exception as e:
+        logger.error(f"create user info fail:{e}")
+        return None
+
+
+# ==============================================
+#  email code
+# ==============================================
+class EmailCode(models.Model):
+    email = models.EmailField()
+    code = models.CharField(max_length=6)
+    created_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        db_table = 'authapp_emailcode'
+
+    def is_valid(self):
+        # 验证码有效期 5 分钟
+        return timezone.now() - self.created_at < timezone.timedelta(minutes=5)
+
+
+# ==============================================
+#  user message
+# ==============================================
+
+class Message(models.Model):
+    class DeliveryType(models.TextChoices):
+        BROADCAST = 'BROADCAST', '广播'
+        USER_SPECIFIC = 'USER_SPECIFIC', '用户专属'
+
+    class MessageType(models.TextChoices):
+        SYSTEM = 'SYSTEM', '系统通知'
+        PROMOTION = 'PROMOTION', '活动优惠'
+        ALERT = 'ALERT', '重要提醒'
+        TRANSACTION = 'TRANSACTION', '交易通知'
+
+    deliver_type = models.CharField(max_length=50, choices=DeliveryType.choices, db_index=True)
+    message_type = models.CharField(max_length=50, choices=MessageType.choices, db_index=True)
+    title = models.CharField(max_length=255)
+    content = models.TextField()
+    is_deleted = models.BooleanField(default=False, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'authapp_message'
+        verbose_name = "消息内容"
+        verbose_name_plural = verbose_name
+
+class UserMessage(models.Model):
+    user = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.CASCADE, related_name='inbox')
+    message = models.ForeignKey(Message, on_delete=models.CASCADE)
+    is_read = models.BooleanField(default=False, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True, verbose_name="接收时间")
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'authapp_user_message'
+        verbose_name = "用户消息状态"
+        verbose_name_plural = verbose_name
+        unique_together = ('user', 'message') # 核心约束
+        ordering = ['-created_at']
+
+
+def get_user_messages(user: User):
+    with transaction.atomic():
+        # 筛选出所有用户需要接收、但尚未关联的广播消息
+        new_broadcast_messages = Message.objects.filter(
+            deliver_type=Message.DeliveryType.BROADCAST,
+            is_deleted=False,
+            created_at__gt=user.created_at
+        ).exclude(
+            usermessage__user=user
+        )
+
+        # 如果有新的广播消息需要关联
+        if new_broadcast_messages.exists():
+            user_messages_to_create = [
+                UserMessage(user=user, message=msg)
+                for msg in new_broadcast_messages
+            ]
+            # 使用 bulk_create 进行批量插入，性能远高于循环创建
+            UserMessage.objects.bulk_create(user_messages_to_create, ignore_conflicts=True)
+
+    unread_messages = UserMessage.objects.filter(
+        user=user,
+        is_read=False,
+        message__is_deleted=False
+    ).select_related('message').order_by('-created_at')
+
+    return unread_messages
+
+
+def add_user_message(user, message_type: Message.MessageType, title: str, content: str = None):
+    if not user or not user.pk:
+        return None
+
+    # 使用数据库事务确保数据完整性。
+    # 如果 Message 创建成功，但 UserMessage 创建失败，整个操作会回滚。
+    with transaction.atomic():
+        new_message_obj = Message.objects.create(
+            deliver_type=Message.DeliveryType.USER_SPECIFIC,
+            message_type=message_type,
+            title=title,
+            content=content or '' # 确保 content 字段不为 None，如果模型定义不允许的话
+        )
+
+        # 将消息与用户关联 (UserMessage)
+        new_user_message = UserMessage.objects.create(
+            user=user,
+            message=new_message_obj
+        )
+
+    return new_user_message
+
+
+def add_broadcast_user_message(message_type: Message.MessageType, title: str, content: Optional[str] = None) -> Message:
+    # 创建消息主体 (Message)，并明确其为广播类型
+    new_broadcast_message = Message.objects.create(
+        deliver_type=Message.DeliveryType.BROADCAST,
+        message_type=message_type,
+        title=title,
+        content=content or ''  # 确保 content 字段不为 None，以匹配模型定义
+    )
+
+    return new_broadcast_message
+
+
+def mark_message_as_read(user, message_id: int) -> UserMessage | None:
+    if not user or not user.pk:
+        return None
+
+    try:
+        msg = UserMessage.objects.get(pk=message_id, user=user)
+    except ObjectDoesNotExist:
+        return None
+
+    if not msg.is_read:
+        msg.is_read = True
+        msg.save(update_fields=['is_read', 'updated_at'])
+        msg.save()
+    return msg
+
+
+def mark_all_message_as_read(user):
+    if not user or not user.pk:
+        return 0
+
+    now = timezone.now()
+    updated_count = (
+        UserMessage.objects
+        .filter(user=user, is_read=False)
+        .update(is_read=True, updated_at=now)
+    )
+
+    return updated_count
