@@ -2,9 +2,11 @@ from django.db import models
 from django.utils.timezone import now
 from django.contrib.auth import get_user_model
 from django.conf import settings
+from django.db import transaction
 from typing import Optional
 from django.utils.dateparse import parse_datetime
 from django.utils.timezone import datetime
+from django.db.models import Q
 
 CONSUME_PRODUCT = 'CONSUME_PRODUCT'
 REWARD_COUPON = 'REWARD_COUPON'
@@ -16,13 +18,17 @@ UNLIMITED_QUANTITY = -1
 
 ORDER_STATUS_SUCCESS = 'SUCCESS'
 
-PACKAGE = 'PACKAGE'  # 套餐
-TIMESCARD = 'TIMESCARD'  # 次卡
+PACKAGE = 'PACKAGE' # 套餐
+TIMESCARD = 'TIMESCARD' # 次卡
+DOWNLOAD = 'DOWNLOAD' # 下载
+
+PACKAGE_TYPES_TIMES = 'TIMES'
 
 # 订单类型
 ORDER_TYPE_CHOICES = [
-    ('PACKAGE', '套餐'),
-    ('TIMESCARD', '次卡'),
+    (PACKAGE, '套餐'),
+    (TIMESCARD, '次卡'),
+    (DOWNLOAD, '下载')
 ]
 
 # 套餐类型
@@ -30,6 +36,7 @@ PACKAGE_TYPES = [
     ('MONTHLY', '月卡'),
     ('SEASONAL', '季卡'),
     ('ANNUAL', '年卡'),
+    ('TIMES', '次卡')
 ]
 
 # 订单状态
@@ -42,15 +49,14 @@ ORDER_STATUS = [
 
 # 操作类型
 OPERATION_TYPE_CHOICES = [
-    ('PURCHASE_PACKAGE', '购买套餐'),
-    ('PURCHASE_PRODUCT', '购买商品'),
-    ('GIVE_SYSTEM', '系统赠送'),
-    ('REWARD_COUPON', '消费券奖励'),
-    ('CONSUME_PRODUCT', '消费商品'),
+    (PURCHASE_PACKAGE, '购买套餐'),
+    (PURCHASE_PRODUCT, '购买商品'),
+    (GIVE_SYSTEM, '系统赠送'),
+    (REWARD_COUPON, '消费券奖励'),
+    (CONSUME_PRODUCT, '消费商品'),
 ]
 
 User = get_user_model()
-
 
 # ==============================================
 #  套餐表
@@ -63,6 +69,27 @@ class Package(models.Model):
     package_type = models.CharField(max_length=20, choices=PACKAGE_TYPES, verbose_name='套餐类型')
     is_active = models.BooleanField(default=True, verbose_name='是否可用')
     description = models.TextField(null=True, blank=True, verbose_name='套餐描述')
+
+    video_link = models.URLField(
+        verbose_name='视频链接',
+        max_length=500,
+        null=True,
+        blank=True
+    )
+    image_link = models.URLField(
+        verbose_name='图像链接',
+        max_length=500,
+        null=True,
+        blank=True
+    )
+    detail_link = models.URLField(
+        verbose_name='详情链接',
+        max_length=500,
+        null=True,
+        blank=True
+    )
+    
+    unit = models.CharField(max_length=20, null=True, blank=True, verbose_name='单位')
     created_at = models.DateTimeField(auto_now_add=True, verbose_name='创建时间')
     updated_at = models.DateTimeField(auto_now=True, verbose_name='更新时间')
 
@@ -85,6 +112,7 @@ class Package(models.Model):
 class Product(models.Model):
     name = models.CharField(max_length=255, unique=True, verbose_name='商品名称')
     price = models.DecimalField(max_digits=10, decimal_places=2, default=0.00, verbose_name='单价')  # 元
+    download_price = models.DecimalField(max_digits=10, decimal_places=2, default=1.00, verbose_name='单价')  # 元
     points = models.PositiveIntegerField(default=0, verbose_name='商品积分')
     is_active = models.BooleanField(default=True, verbose_name='是否上架')
     description = models.TextField(blank=True, null=True, verbose_name='商品描述')
@@ -109,8 +137,7 @@ class Order(models.Model):
     package = models.ForeignKey(Package, null=True, blank=True, on_delete=models.CASCADE, verbose_name='购买的套餐')
     product = models.ForeignKey(Product, null=True, blank=True, on_delete=models.CASCADE, verbose_name='购买的商品')
     quantity = models.IntegerField(default=0, verbose_name='购买数量')
-    price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True,
-                                verbose_name='订单金额(单位: 元)')
+    price = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True,  verbose_name='订单金额(单位: 元)')
     payment_type = models.CharField(max_length=20, null=True, blank=True, verbose_name='支付方式')
     user_ip = models.GenericIPAddressField(null=True, blank=True, verbose_name='用户IP地址')
     order_status = models.CharField(max_length=10, choices=ORDER_STATUS, default='NOTPAY', verbose_name='订单状态')
@@ -152,13 +179,11 @@ class PackageProduct(models.Model):
     def package_type_chinese(self):
         package_type_map = dict(PACKAGE_TYPES)
         return package_type_map.get(self.package_type, self.package_type)
-
-
+    
 def query_package_product_by_package(package):
     if not package:
         return PackageProduct.objects.none()
     return PackageProduct.objects.filter(package=package)
-
 
 # ==============================================
 #  用户商品记录表
@@ -203,7 +228,6 @@ def query_user_product_package_record(user, product):
         .first()  # 取最新的一条记录
     )
 
-
 def query_user_product_times_card_record(user, product):
     """
     查询用户某个商品的最新“次卡”记录(total_quantity>0)
@@ -223,7 +247,27 @@ def query_user_product_times_card_record(user, product):
         .first()  # 取最新的一条记录
     )
 
+def query_product_ids_by_user(user):
+    """
+    返回用户所有“未过期套餐”或“有效次卡”对应的 product_id 列表（不重复）
+    """
+    if not user:
+        return []
 
+    now_ts = now()
+    qs = UserProduct.objects.filter(
+        user=user
+    ).filter(
+        # （套餐 且 未过期） 或 （次卡 且 还剩余次数或无限次）
+        Q(order_type=PACKAGE, expire_date__gt=now_ts) |
+        Q(order_type=PACKAGE, expire_date__isnull=True) |
+        Q(order_type=TIMESCARD, total_quantity__gt=0)
+    ).values_list('product_id', flat=True).distinct()
+
+    return list(qs)
+
+
+@transaction.atomic
 def create_user_product_record(
         user: User,
         product: 'Product',
@@ -232,12 +276,11 @@ def create_user_product_record(
         change_quantity: int,
         total_quantity: int,
         expire_date: Optional[datetime]
-) -> None:
+        )-> None:
     """
     创建用户产品使用记录
     """
-    print(
-        f"product:{product} order_type:{order_type} operation_type:{operation_type} change_quantity:{change_quantity} total_quantity：{total_quantity} expire_date：{expire_date}")
+    print(f"product:{product} order_type:{order_type} operation_type:{operation_type} change_quantity:{change_quantity} total_quantity：{total_quantity} expire_date：{expire_date}")
     if order_type not in dict(ORDER_TYPE_CHOICES):
         raise ValueError(f"Invalid order_type: {order_type}")
 
@@ -246,6 +289,8 @@ def create_user_product_record(
 
     if isinstance(expire_date, str):
         expire_date = parse_datetime(expire_date)
+        if not expire_date:
+            raise ValueError(f"Invalid expire_date: {expire_date}")
 
     if expire_date is not None and not isinstance(expire_date, datetime):
         raise TypeError(f"Parameter 'expire_date' must be a datetime object or None, got {type(expire_date).__name__}")
@@ -260,7 +305,6 @@ def create_user_product_record(
         total_quantity=total_quantity,
         description=""
     )
-
 
 # ==============================================
 #  用户积分记录表
@@ -290,14 +334,13 @@ class UserPoints(models.Model):
     def __str__(self):
         return f"{self.user} - total_points: {self.total_points}"
 
-
 def query_user_point_record(user):
     if not isinstance(user, User):
         raise ValueError("Invalid User Object")
 
     return (
         UserPoints.objects
-        .filter(user=user, )
+        .filter(user=user,)
         .order_by('-created_at')  # 按创建时间降序排列，最新的在最前
         .first()  # 取最新的一条记录
     )
