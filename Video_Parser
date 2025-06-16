@@ -1,0 +1,545 @@
+import cv2
+import numpy as np
+import os
+import shutil
+from typing import List, Tuple, Dict, Optional,Any
+from tqdm import tqdm
+from moviepy import VideoFileClip
+from scenedetect import SceneManager,open_video 
+from scenedetect.detectors import ContentDetector
+from scenedetect.frame_timecode import FrameTimecode 
+
+def seconds_to_srt(time_in_seconds: float) -> str:
+    """将秒数格式化为 SRT 标准时间戳 HH:MM:SS,mmm"""
+    if not isinstance(time_in_seconds, (int, float)):
+        utils.print2(f"警告: format_timestamp 收到无效类型 {type(time_in_seconds)}，返回默认值。")
+        time_in_seconds = 0.0
+    if time_in_seconds < 0: 
+        time_in_seconds = 0.0
+    
+    hours = int(time_in_seconds // 3600)
+    minutes = int((time_in_seconds % 3600) // 60)
+    seconds = int(time_in_seconds % 60)
+    milliseconds = int(round((time_in_seconds * 1000) % 1000)) # 四舍五入毫秒
+    
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d},{milliseconds:03d}"
+
+class VideoFileProcessor:
+    def __init__(self, video_path: str):
+        if not os.path.exists(video_path):
+            msg = f"错误: VideoFileProcessor 初始化失败 - 视频文件不存在于路径: '{video_path}'"
+            raise FileNotFoundError(msg)
+        
+        self.source_clip = VideoFileClip(video_path)
+
+        self.video_path = os.path.abspath(video_path)
+        self.cap = cv2.VideoCapture(self.video_path)
+        self._is_valid = self.cap.isOpened()
+
+        if not self._is_valid:
+            if hasattr(self, 'cap') and self.cap:
+                self.cap.release()
+            msg = f"错误: VideoFileProcessor 初始化失败 - 无法使用OpenCV打开视频文件: '{self.video_path}'"
+            raise RuntimeError(msg)
+
+        self.total_frames: int = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.fps: float = float(self.cap.get(cv2.CAP_PROP_FPS))
+        self.width: int = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        self.height: int = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        self.video_name_for_log = os.path.basename(self.video_path)
+
+        if self.fps is None or self.fps <= 0:
+            print(f"警告: 视频 '{self.video_name_for_log}' 的FPS无效 ({self.fps}). 尝试通过MoviePy获取。")
+            try:
+                with VideoFileClip(self.video_path, audio=False) as clip: # audio=False 减少开销
+                    self.fps = clip.fps
+                    if self.fps is None or self.fps <=0: 
+                        raise ValueError("MoviePy FPS also invalid")
+                    print(f"  通过MoviePy获取FPS: {self.fps:.2f}")
+                    if self.total_frames <= 0 and hasattr(clip, 'duration') and clip.duration and clip.duration > 0:
+                        self.total_frames = int(clip.duration * self.fps)
+            except Exception as e_mp_fps:
+                msg = f"  使用MoviePy获取FPS失败: {e_mp_fps}. 将使用默认值30.0."
+                print(msg)
+                raise RuntimeError(msg)
+
+        if self.width <= 0 or self.height <= 0:
+             msg = f"警告: 视频 '{self.video_name_for_log}' 的宽度或高度无效 ({self.width}x{self.height})."
+             print(msg)
+             raise RuntimeError(msg)
+
+        print(f"VideoFileProcessor for '{self.video_name_for_log}' 初始化成功 (FPS: {self.fps:.2f}, Frames: {self.total_frames}, Res: {self.width}x{self.height}).")
+    
+    def get_subclip(self, start_sec, end_sec):
+        return self.source_clip.subclipped(start_sec, end_sec)
+    
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+    def release(self) -> None:
+        if self.source_clip:
+            self.source_clip.close()
+            
+        if hasattr(self, 'cap') and self.cap and self.cap.isOpened():
+            self.cap.release()
+            print(f"VideoFileProcessor for '{self.video_name_for_log}' 已释放OpenCV资源。")
+
+    def is_valid(self) -> bool:
+        return self._is_valid and self.cap.isOpened()
+
+    def get_duration(self) -> Optional[float]:
+        if self.is_valid() and self.total_frames > 0 and self.fps > 0:
+            return self.total_frames / self.fps
+        try:
+            with VideoFileClip(self.video_path, audio=False) as clip:
+                if hasattr(clip, 'duration') and clip.duration and clip.duration > 0:
+                    return clip.duration
+        except Exception as e_mp_dur:
+            print(f"  使用MoviePy获取视频 '{self.video_name_for_log}' 时长失败: {e_mp_dur}")
+        print(f"错误: 无法准确计算视频 '{self.video_name_for_log}' 的总时长。")
+        return None
+
+    def extract_specific_frames_at_timestamps(self, timestamps_sec: List[float]) -> Dict[float, Optional[np.ndarray]]:
+        if not self.is_valid() or self.fps <= 0:
+            return {ts: None for ts in timestamps_sec}
+        extracted_frames_map: Dict[float, Optional[np.ndarray]] = {}
+        video_duration = self.get_duration()
+        if video_duration is None: video_duration = float('inf')
+        frame_numbers_to_extract: List[Tuple[float, int]] = []
+        for ts in sorted(list(set(timestamps_sec))):
+            if 0 <= ts <= video_duration:
+                frame_num = int(round(ts * self.fps))
+                if self.total_frames > 0 and frame_num >= self.total_frames:
+                    frame_num = self.total_frames -1
+                if frame_num >=0:
+                    frame_numbers_to_extract.append((ts, frame_num))
+            else:
+                extracted_frames_map[ts] = None
+        current_frames_map = self.extract_specific_frames([fn for _, fn in frame_numbers_to_extract])
+        for ts, frame_num in frame_numbers_to_extract:
+            extracted_frames_map[ts] = current_frames_map.get(frame_num)
+        return extracted_frames_map
+
+    def extract_specific_frames(self, frame_numbers: List[int]) -> Dict[int, np.ndarray]:
+        if not self.is_valid(): return {}
+        extracted_frames_map: Dict[int, np.ndarray] = {}
+        valid_frame_indices_to_extract: List[int]
+        if self.total_frames > 0:
+            valid_frame_indices_to_extract = sorted(list(set(fn for fn in frame_numbers if 0 <= fn < self.total_frames)))
+        else:
+            valid_frame_indices_to_extract = sorted(list(set(fn for fn in frame_numbers if fn >= 0)))
+        if not valid_frame_indices_to_extract: return {}
+        
+        # 优化：如果帧号是连续或接近连续的，可以避免频繁seek
+        # 这里简单实现，如果需要极致性能，可以考虑更复杂的读取策略
+        last_read_idx = -100 # 一个远离0的值
+        for frame_idx_to_read in tqdm(valid_frame_indices_to_extract, desc=f"提取 {len(valid_frame_indices_to_extract)}帧 from '{self.video_name_for_log}'", unit="frame"):
+            # 只有当目标帧号与上一读取帧号不连续时才执行set操作
+            if frame_idx_to_read != last_read_idx + 1 or last_read_idx == -100:
+                 if not self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx_to_read):
+                    print(f"  警告: OpenCV无法定位到帧号 {frame_idx_to_read}。")
+                    continue # 跳过此帧
+            
+            ret, frame_data = self.cap.read()
+            if ret:
+                extracted_frames_map[frame_idx_to_read] = frame_data
+                last_read_idx = frame_idx_to_read
+            else:
+                print(f"  警告: 无法读取帧号 {frame_idx_to_read} (尝试定位后读取失败)。")
+                if self.total_frames > 0 and frame_idx_to_read < self.total_frames:
+                    pass 
+                else: 
+                    break 
+        return extracted_frames_map
+
+    def save_frames(self,
+                    frames_data_map: Dict[int, np.ndarray],
+                    output_directory: str,
+                    filename_prefix: str = "kf",
+                    scene_info: Optional[Dict[str, Any]] = None,
+                    frame_type_info: str = "generic") -> List[str]:
+        saved_paths: List[str] = []
+        if not os.path.isdir(output_directory):
+            try: 
+                os.makedirs(output_directory, exist_ok=True)
+            except OSError as e_mkdir:
+                 print(f"错误: 创建输出目录 '{output_directory}' 失败: {e_mkdir}"); 
+                 return saved_paths
+            
+        if not self.is_valid(): 
+            return saved_paths
+        
+        if self.fps <= 0: 
+            print(f"  警告: FPS无效 ({self.fps})，文件名中的时间戳可能不准或基于默认FPS。")
+
+        for frame_original_idx, frame_pixel_data in frames_data_map.items(): # 不再用tqdm，调用处有
+            filename_parts = [filename_prefix]
+            if scene_info and isinstance(scene_info.get("scene_number"), int):
+                filename_parts.append(f"scene{scene_info['scene_number']:03d}")
+            filename_parts.append(f"frame{frame_original_idx:07d}")
+            current_fps = self.fps if self.fps > 0 else 30.0
+            timestamp_in_seconds = frame_original_idx / current_fps
+            time_code_str = seconds_to_srt(timestamp_in_seconds).replace(":", "").replace(",", "")
+            filename_parts.append(time_code_str)
+            output_image_path = os.path.join(output_directory, "_".join(filename_parts) + ".jpg")
+            try:
+                cv2.imwrite(output_image_path, frame_pixel_data)
+                saved_paths.append(output_image_path)
+            except Exception as e_imwrite_err:
+                print(f"错误: 保存帧图像到 '{output_image_path}' 失败: {e_imwrite_err}")
+        return saved_paths
+
+    def detect_scenes_pyscenedetect(self,
+                                    threshold: float = 27.0,
+                                    min_scene_len_frames: int = 15 # PySceneDetect v0.6+ min_scene_len is in frames
+                                   ) -> List[Dict[str, Any]]:
+
+        print(f"  使用 PySceneDetect v0.66+ (ContentDetector, threshold={threshold}, min_len={min_scene_len_frames} frames) 检测场景 for '{self.video_name_for_log}'...")
+        scene_list_output: List[Dict[str, Any]] = []
+        
+        # video_stream will be an instance of a VideoStream (e.g., VideoStreamCv2)
+        video_stream = None 
+        try:
+            # 1. 打开视频流
+            # open_video 会根据可用的后端自动选择（通常是 OpenCV，即 VideoStreamCv2）
+            # 它需要视频路径和帧率（如果无法从视频中自动检测）
+            # 我们的 VideoFileProcessor 已经有 self.fps
+            video_stream = open_video(self.video_path, framerate=self.fps if self.fps and self.fps > 0 else None)
+
+            # 2. 创建 SceneManager
+            scene_manager = SceneManager()
+
+            # 3. 添加检测器
+            # ContentDetector 的 min_scene_len 参数在 v0.6+ 中是以帧为单位的
+            scene_manager.add_detector(
+                ContentDetector(threshold=threshold, min_scene_len=min_scene_len_frames)
+            )
+
+            # 4. 执行场景检测
+            # detect_scenes 现在直接使用 video_stream 对象
+            # PySceneDetect v0.6+ 会在内部处理视频帧的读取和进度
+            # show_progress=False 因为我们通常有自己的外部进度条或日志
+            scene_manager.detect_scenes(video=video_stream, show_progress=False)
+
+            # 5. 获取场景列表
+            # get_scene_list() 返回 List[Tuple[FrameTimecode, FrameTimecode]]
+            # 不需要 base_timecode 参数了
+            detected_scene_list_raw = scene_manager.get_scene_list()
+
+            if not detected_scene_list_raw and video_stream.duration and video_stream.duration.get_seconds() > 0:
+                # 如果没有检测到场景，但视频有有效时长，则将整个视频视为一个场景
+                print("  PySceneDetect 未检测到特定场景边界，将整个视频视为单一场景。")
+                start_tc = FrameTimecode(timecode=0, fps=video_stream.frame_rate) # 创建FrameTimecode对象
+                #start_tc = video_stream.base_timecode # 通常是 00:00:00.000
+                end_tc = video_stream.duration
+                detected_scene_list_raw = [(start_tc, end_tc)]
+
+
+            for i, scene_boundaries in enumerate(detected_scene_list_raw):
+                start_timecode, end_timecode = scene_boundaries
+                
+                # 对于最后一个场景，end_timecode 可能等于视频总时长。
+                # 如果 end_timecode.get_frames() 等于 total_frames，这意味着它是视频的“结束”标记。
+                # 场景的实际最后一帧是 end_frame - 1。
+                
+                # 确保 end_frame 不超过视频总帧数（如果已知）
+                actual_end_frame = end_timecode.get_frames()
+                if self.total_frames > 0 and actual_end_frame > self.total_frames:
+                    # print(f"  警告: 场景 {i+1} 的结束帧 ({actual_end_frame}) 超出视频总帧数 ({self.total_frames})。已修正。")
+                    # 尝试使用视频总时长或总帧数来校正 FrameTimecode
+                    # This might be complex if framerates differ or base_timecode isn't zero.
+                    # For now, let's trust PySceneDetect's end_timecode unless it's clearly out of video bounds.
+                    # A simple cap:
+                    actual_end_frame = min(actual_end_frame, self.total_frames if self.total_frames > 0 else actual_end_frame)
+                    # Reconstruct end_timecode if capped, ensuring it's based on video_stream's framerate
+                    # end_timecode = FrameTimecode(timecode=actual_end_frame, fps=video_stream.frame_rate)
+
+                scene_data = {
+                    "scene_number": i + 1,
+                    "start_sec": start_timecode.get_seconds(),
+                    "end_sec": end_timecode.get_seconds(), # This is exclusive end
+                    "start_frame": start_timecode.get_frames(),
+                    "end_frame": actual_end_frame, # This is exclusive end frame index
+                    "duration_sec": (end_timecode - start_timecode).get_seconds()
+                }
+                # 确保场景有有效时长
+                if scene_data["duration_sec"] > 0.001: # 避免几乎为零的场景
+                    scene_list_output.append(scene_data)
+
+            if scene_list_output:
+                print(f"  PySceneDetect 检测到 {len(scene_list_output)} 个有效时长的场景。")
+            elif detected_scene_list_raw: # 有原始检测结果但过滤后为空
+                 print(f"  PySceneDetect 原始检测到 {len(detected_scene_list_raw)} 个场景，但过滤后无有效时长场景。")
+            else: # 完全没有检测到
+                 print(f"  PySceneDetect 未能从视频中检测到任何场景。")
+
+        except Exception as e_psd:
+            print(f"  PySceneDetect 场景检测过程中发生错误: {e_psd}")
+
+        return scene_list_output
+
+    def sample_keyframes_from_scene(
+        self,
+        scene_info: Dict[str, Any], # 包含 start_frame, end_frame (排他)
+        num_keyframes_per_scene: int = 3,
+        sampling_strategy: str = "uniform_interval"
+    ) -> List[int]: # 返回场景内关键帧的绝对帧索引列表
+        """
+        从给定的场景信息中采样关键帧。
+
+        Args:
+            scene_info: 包含 "start_frame" 和 "end_frame" (排他) 的字典。
+            num_keyframes_per_scene: 希望从该场景采样的关键帧数量。
+            sampling_strategy: 采样策略 ("uniform_interval", "middle", "start_middle_end").
+
+        Returns:
+            一个包含关键帧绝对帧索引的列表。
+        """
+        if not self.is_valid() or self.fps <= 0: # 确保 VideoFileProcessor 有效且FPS可用
+            # print(f"  sample_keyframes_from_scene: VideoProcessor无效或FPS为0，无法采样。")
+            return []
+
+        scene_start_frame = scene_info.get("start_frame")
+        scene_end_frame = scene_info.get("end_frame") # PySceneDetect的end_frame是排他的
+
+        if scene_start_frame is None or scene_end_frame is None:
+            # print(f"  sample_keyframes_from_scene: 场景信息缺少start_frame或end_frame。")
+            return []
+        
+        # 类型转换和校验
+        try:
+            scene_start_frame = int(scene_start_frame)
+            scene_end_frame = int(scene_end_frame)
+        except ValueError:
+            print(f"  sample_keyframes_from_scene: 场景帧号无法转换为整数。")
+            return []
+
+        scene_duration_frames = scene_end_frame - scene_start_frame
+
+        keyframe_abs_indices: List[int] = []
+
+        if scene_duration_frames <= 0 or num_keyframes_per_scene <= 0:
+            return [] # 场景无时长或不请求采样则返回空
+
+        # 实际采样的帧数不能超过场景的总帧数
+        # 且如果场景有内容但请求采样0帧（通过num_keyframes_per_scene <= 0已过滤），则至少采样1帧
+        actual_num_to_sample = min(num_keyframes_per_scene, scene_duration_frames)
+        if actual_num_to_sample == 0 and scene_duration_frames > 0: # 确保至少采样1帧如果场景有内容
+            actual_num_to_sample = 1
+        
+        # (scene_duration_frames - 1) 是因为帧索引从0开始，代表有效的相对偏移量范围
+        # 例如，一个3帧的场景（帧0,1,2），duration_frames = 3, 最后一个索引是 start + (3-1)
+        last_frame_relative_offset = scene_duration_frames - 1
+
+        if sampling_strategy == "uniform_interval":
+            if actual_num_to_sample == 1:
+                # 取场景中间帧（向下取整）
+                keyframe_abs_indices.append(scene_start_frame + last_frame_relative_offset // 2)
+            else:
+                # 包含场景的第一帧和最后一帧（的前一帧）
+                for i in range(actual_num_to_sample):
+                    offset = round(i * last_frame_relative_offset / (actual_num_to_sample - 1))
+                    keyframe_abs_indices.append(scene_start_frame + int(offset))
+
+        elif sampling_strategy == "middle":
+            keyframe_abs_indices.append(scene_start_frame + last_frame_relative_offset // 2)
+
+        elif sampling_strategy == "start_middle_end" and actual_num_to_sample > 0:
+            # 根据 actual_num_to_sample 智能添加
+            keyframe_abs_indices.append(scene_start_frame) # 开始帧
+            if actual_num_to_sample > 2: # 需要至少3个采样点才有中间
+                 keyframe_abs_indices.append(scene_start_frame + last_frame_relative_offset // 2) # 中间帧
+            if actual_num_to_sample > 1: # 至少2个采样点才有结束
+                 keyframe_abs_indices.append(scene_start_frame + last_frame_relative_offset) # 场景的最后一帧
+
+        else: # 默认或未识别的策略，回退到 uniform_interval
+            # print(f"  sample_keyframes_from_scene: 未知采样策略 '{sampling_strategy}', 使用 'uniform_interval'.")
+            if actual_num_to_sample == 1:
+                keyframe_abs_indices.append(scene_start_frame + last_frame_relative_offset // 2)
+            elif actual_num_to_sample > 1 : # 确保 actual_num_to_sample - 1 不为0
+                for i in range(actual_num_to_sample):
+                    offset = round(i * last_frame_relative_offset / (actual_num_to_sample - 1))
+                    keyframe_abs_indices.append(scene_start_frame + int(offset))
+        
+        # 去重并确保帧号在场景有效范围内
+        # scene_end_frame 是排他的，所以有效的最大帧索引是 scene_end_frame - 1
+        valid_last_frame_index = scene_end_frame - 1 if scene_duration_frames > 0 else scene_start_frame
+        
+        final_indices_in_scene_range = []
+        for idx in keyframe_abs_indices:
+            # 钳制到场景的有效帧范围内
+            clamped_idx = max(scene_start_frame, min(idx, valid_last_frame_index))
+            final_indices_in_scene_range.append(clamped_idx)
+            
+        # 去重并排序
+        unique_sorted_indices = sorted(list(set(final_indices_in_scene_range)))
+        
+        # 再次确保不超过请求数量 (理论上按策略计算应该不会超，但作为保险)
+        return unique_sorted_indices[:actual_num_to_sample]
+
+    def extract_scene_based_keyframes(self,
+                                  output_keyframes_dir: str,
+                                  pyscenedetect_threshold: float = 27.0,
+                                  min_scene_len_frames_pysd: int = 15,
+                                  kf_per_short_scene: int = 2,
+                                  kf_per_medium_scene: int = 3,
+                                  kf_per_long_scene: int = 5,
+                                  short_scene_duration_thresh_sec: float = 10.0,
+                                  medium_scene_duration_thresh_sec: float = 60.0,
+                                  kf_sampling_strategy: str = "uniform_interval",
+                                  global_max_total_keyframes: Optional[int] = 200,
+                                  global_min_total_keyframes: Optional[int] = 10,
+                                  precomputed_scenes: Optional[List[Dict[str, Any]]] = None
+                                 ) -> List[str]:
+        """
+        基于场景检测提取关键帧，并支持使用预先计算好的场景列表以提高效率。
+
+        该函数首先确定场景列表（优先使用传入的`precomputed_scenes`），然后根据每个场景的
+        时长和配置的采样策略，从场景中采样关键帧。最后，根据全局最大/最小关键帧数限制
+        对所有选出的关键帧进行降采样或增采样，并提取、保存这些帧。
+
+        Args:
+            output_keyframes_dir: 保存提取出的关键帧图像的目录。
+            pyscenedetect_threshold: PySceneDetect的ContentDetector阈值。
+            min_scene_len_frames_pysd: PySceneDetect场景的最小长度（帧）。
+            ... (其他参数): 控制每个场景采样数量和策略的配置。
+            precomputed_scenes: (可选) 一个预先计算好的场景列表。如果提供，将跳过
+                                内部的场景检测步骤。
+
+        Returns:
+            一个包含所有成功保存的关键帧文件路径的列表。
+        """
+        print(f"开始基于场景的关键帧提取 for '{self.video_name_for_log}'...")
+        if not self.is_valid():
+            print("  错误: VideoProcessor无效，无法提取关键帧。")
+            return []
+
+        # --- 1. 确定场景列表 ---
+        if precomputed_scenes is not None:
+            print("  使用预先计算的场景列表进行关键帧提取。")
+            detected_scenes = precomputed_scenes
+        else:
+            print("  未提供预计算场景，将执行新的场景检测。")
+            detected_scenes = self.detect_scenes_pyscenedetect(
+                threshold=pyscenedetect_threshold,
+                min_scene_len_frames=min_scene_len_frames_pysd
+            )
+
+        # --- 2. 处理无场景的特殊情况（回退逻辑）---
+        if not detected_scenes:
+            print("  未能检测到任何场景。尝试提取视频全局代表帧作为回退。")
+            duration = self.get_duration()
+            if duration and duration > 0:
+                # 确定回退时要提取的帧数
+                num_fallback_frames = global_min_total_keyframes if global_min_total_keyframes is not None else 5
+                num_fallback_frames = min(num_fallback_frames, self.total_frames if self.total_frames > 0 else num_fallback_frames)
+
+                if num_fallback_frames <= 0:
+                    print("  回退失败：计算出的回退帧数为0。")
+                    return []
+                
+                # 使用np.linspace均匀生成时间戳，确保包含视频的开始和结束
+                fallback_timestamps = np.linspace(0, duration, num_fallback_frames, endpoint=True).tolist()
+                
+                # 提取并保存这些回退帧
+                print(f"  提取视频全局代表帧于时间点 (约): {[f'{ts:.2f}s' for ts in fallback_timestamps]}")
+                frames_data_map_fallback = self.extract_specific_frames_at_timestamps(fallback_timestamps)
+                valid_frames_to_save = {
+                    int(round(ts * (self.fps if self.fps > 0 else 30.0))): data
+                    for ts, data in frames_data_map_fallback.items() if data is not None
+                }
+                if valid_frames_to_save:
+                    return self.save_frames(valid_frames_to_save, output_keyframes_dir, filename_prefix="fallback_kf", frame_type_info="fallback")
+            
+            print("  回退失败：无法获取视频时长或时长为0。")
+            return []
+
+        # --- 3. 从每个场景中采样关键帧 ---
+        all_keyframe_abs_indices_to_extract: List[int] = []
+        for scene_idx, scene in enumerate(tqdm(detected_scenes, desc="场景内采样", unit="scene")):
+            scene_info_for_sampling = scene.copy()
+            scene_info_for_sampling["scene_number"] = scene_idx + 1
+            scene_duration = scene.get("duration_sec", 0)
+
+            num_kf_for_this_scene: int
+            if scene_duration <= short_scene_duration_thresh_sec:
+                num_kf_for_this_scene = kf_per_short_scene
+            elif scene_duration <= medium_scene_duration_thresh_sec:
+                num_kf_for_this_scene = kf_per_medium_scene
+            else:
+                num_kf_for_this_scene = kf_per_long_scene
+
+            indices_in_scene = self.sample_keyframes_from_scene(
+                scene_info_for_sampling, num_keyframes_per_scene=num_kf_for_this_scene, sampling_strategy=kf_sampling_strategy
+            )
+            all_keyframe_abs_indices_to_extract.extend(indices_in_scene)
+
+        # 去重并排序，得到初步的候选帧列表
+        unique_abs_indices = sorted(list(set(idx for idx in all_keyframe_abs_indices_to_extract if idx >= 0)))
+        print(f"  初步从所有场景中选定 {len(unique_abs_indices)} 个唯一关键帧索引。")
+
+        # --- 4. 全局帧数控制（降采样或增采样）---
+        final_indices_after_global_control = unique_abs_indices
+        num_unique = len(unique_abs_indices)
+
+        # 如果超出最大值，进行降采样
+        if global_max_total_keyframes is not None and num_unique > global_max_total_keyframes:
+            print(f"  总关键帧数 {num_unique} 超出全局上限 {global_max_total_keyframes}，将进行均匀降采样。")
+            # 使用np.linspace生成要抽取的索引
+            indices_to_pick_float = np.linspace(0, num_unique - 1, global_max_total_keyframes)
+            indices_to_pick_int = np.round(indices_to_pick_float).astype(int)
+            final_indices_after_global_control = [unique_abs_indices[i] for i in sorted(list(set(indices_to_pick_int)))]
+            print(f"  全局降采样后剩余 {len(final_indices_after_global_control)} 帧。")
+        
+        # 如果低于最小值，进行增采样（或全选）
+        elif global_min_total_keyframes is not None and num_unique < global_min_total_keyframes:
+            print(f"  总关键帧数 {num_unique} 低于全局下限 {global_min_total_keyframes}，将尝试补充。")
+            if num_unique > 0:
+                # 如果候选帧太少，无法通过插值补充，则直接使用所有候选帧
+                # 如果要强制达到min，可以从原始帧中重新采样，但这里选择更简单的策略：全选
+                final_indices_after_global_control = unique_abs_indices
+                print(f"  由于候选帧不足，已选择全部 {num_unique} 帧。")
+            # 如果num_unique为0，则final_indices_after_global_control也为空，后续会正确处理
+            
+        if not final_indices_after_global_control:
+            print("  警告: 经过场景分析和全局控制后，没有选出任何关键帧。")
+            return []
+
+        # --- 5. 提取并保存最终选定的关键帧 ---
+        print(f"  准备提取并保存最终选定的 {len(final_indices_after_global_control)} 个高清关键帧...")
+        hd_keyframes_data = self.extract_specific_frames(final_indices_after_global_control)
+        saved_kf_paths: List[str] = []
+
+        if hd_keyframes_data:
+            # 创建一个从帧号到其所属场景信息的映射，用于正确命名文件
+            frame_to_scene_map: Dict[int, Dict[str, Any]] = {}
+            for scene in detected_scenes:
+                start_frame = scene.get('start_frame', -1)
+                end_frame = scene.get('end_frame', -1)
+                if start_frame >= 0 and end_frame > start_frame:
+                    for frame_num_in_scene in range(start_frame, end_frame):
+                        frame_to_scene_map[frame_num_in_scene] = scene
+            
+            for abs_frame_idx in tqdm(final_indices_after_global_control, desc="保存最终关键帧", unit="frame"):
+                frame_data = hd_keyframes_data.get(abs_frame_idx)
+                if frame_data is None:
+                    continue
+
+                # 查找该帧所属的场景信息
+                current_scene_info = frame_to_scene_map.get(abs_frame_idx)
+                
+                # 调用save_frames保存单帧
+                paths_this_frame = self.save_frames(
+                    frames_data_map={abs_frame_idx: frame_data},
+                    output_directory=output_keyframes_dir,
+                    filename_prefix="hd_kf",
+                    scene_info=current_scene_info,
+                    frame_type_info="scene_based"
+                )
+                saved_kf_paths.extend(paths_this_frame)
+        
+        print(f"场景化关键帧提取完成。共保存 {len(saved_kf_paths)} 张高清关键帧到 '{output_keyframes_dir}'。")
+        return saved_kf_paths
